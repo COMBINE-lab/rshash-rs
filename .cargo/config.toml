@@ -1,0 +1,3 @@
+# RSHash uses BMI2 pext/pdep in hot loops (C++ builds with -march=native).
+[build]
+rustflags = ["-C", "target-cpu=native"]
