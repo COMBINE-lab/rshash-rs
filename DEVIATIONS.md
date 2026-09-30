@@ -228,9 +228,9 @@ The port uses `O = max_i max(overlap_right_i, overlap_left_i + run_i − K)`:
 | C++ | Port |
 |---|---|
 | sux `EliasFano` fork | `ef::EliasFano`: same `l = floor(log2(u/n))` layout, `contains → rank`, `select`, `select(r, &next)`, predecessor |
-| sux `SimpleSelect`, sdsl `bit_vector` | `bits::RankSelect`: rank9-style directory plus two-level exact-position select samples |
+| sux `SimpleSelect`/`SimpleSelectZeroHalf`, sdsl `bit_vector` | `bits::RankSelect`: rank9-style directory, plus a sux-style interleaved select inventory (position of every 256th target bit and 16-bit offsets of every 64th) built only for the select direction each structure uses |
 | pthash `compact_vector` | `bits::CompactVec` |
-| gtl `flat_hash_set`/`FlatMap` | std hash set/map with a murmur3-`fmix64` hasher; locate buckets as bitvector plus packed positions |
+| gtl `flat_hash_set`/`FlatMap` | std hash set/map with a murmur3-`fmix64` hasher, behind a derived one-hash bit filter (8–16 bits/key) that screens absent keys; locate buckets as bitvector plus packed positions |
 | seqan3 `sequence_file_input` | needletail (FASTA/FASTQ, gz/bz2/xz/zstd) |
 | kxsort | `sort_unstable` on 12-byte (minimiser, position) pairs when positions fit in 32 bits (as `MinimizerInfo32`), else 16-byte pairs |
 | cereal | own serialisation (D12) |
@@ -238,6 +238,7 @@ The port uses `O = max_i max(overlap_right_i, overlap_left_i + run_i − K)`:
 Two more differences:
 
 - The streaming lookup engine keeps its caches across query records; C++ reallocates them per record. Results are unaffected.
+- `rshash lookup` and `locate` load the index *before* the queries. On hosts with transparent huge pages this gives the index arrays better page placement, which measurably speeds up queries.
 - Report labels match C++ where their meaning is the same:
   - `no distinct minimiser{i}` prints the number of occurrences; C++ prints `s.size()`, which is occurrences + 1.
   - `no freq kmers` prints the number of distinct last-level keys, as in C++.

@@ -235,9 +235,10 @@ impl<W: KmerWord> RsHash<W> {
             let (cands, n) = self.candidates(level, level.offsets.get(i), st);
             for &(kq, fwd) in &cands[..n] {
                 if let Some((win, p)) = self.window_at_kernel(kq)
-                    && self.matches(win, p, fwd, q) {
-                        out.push(Hit { pos: p as u64, forward: fwd });
-                    }
+                    && self.matches(win, p, fwd, q)
+                {
+                    out.push(Hit { pos: p as u64, forward: fwd });
+                }
             }
         }
     }
@@ -345,31 +346,26 @@ pub struct StreamingLookup<'a, W: KmerWord> {
     levels: Vec<LevelCache<W>>,
     /// Number of windows found by extension (`extensions`).
     pub extensions: u64,
-    // match state
-    found: bool,
+}
+
+/// The text window matched by the previous query window, which the next one
+/// may extend (`text_pos`, `forward`, `sequence_begin/end`, `text_kmer(_rc)`).
+/// Kept in locals of the query loop so it lives in registers.
+#[derive(Clone, Copy, Debug)]
+struct Anchor<W: KmerWord> {
     forward: bool,
+    /// Last base of the window (forward) or first base (reverse complement).
     text_pos: u64,
     seq_start: u64,
     seq_end: u64,
-    text_win: W,
-    text_win_rc: W,
+    /// The matched text window (forward) or its reverse-complement orientation.
+    win: W,
 }
 
 impl<'a, W: KmerWord> StreamingLookup<'a, W> {
     pub fn new(idx: &'a RsHash<W>) -> Self {
         let levels = idx.levels.iter().map(LevelCache::new).collect();
-        Self {
-            idx,
-            levels,
-            extensions: 0,
-            found: false,
-            forward: true,
-            text_pos: 0,
-            seq_start: 0,
-            seq_end: 0,
-            text_win: W::ZERO,
-            text_win_rc: W::ZERO,
-        }
+        Self { idx, levels, extensions: 0 }
     }
 
     /// Number of windows of `seq` (ASCII) present in the index.
@@ -378,171 +374,271 @@ impl<'a, W: KmerWord> StreamingLookup<'a, W> {
     }
 
     /// Like [`Self::query`], calling `f(window index, found)` per window.
-    pub fn query_with(&mut self, seq: &[u8], mut f: impl FnMut(usize, bool)) -> u64 {
+    pub fn query_with(&mut self, seq: &[u8], f: impl FnMut(usize, bool)) -> u64 {
+        if self.idx.shapes.is_empty() { self.run::<false>(seq, f) } else { self.run::<true>(seq, f) }
+    }
+
+    /// The query loop, monomorphised for contiguous k-mers / shapes.
+    #[inline(always)]
+    fn run<const SHAPES: bool>(&mut self, seq: &[u8], mut f: impl FnMut(usize, bool)) -> u64 {
         let idx = self.idx;
-        let l = idx.geo.window;
-        self.found = false;
-        for c in &mut self.levels {
+        let l = idx.geo.window as usize;
+        if seq.len() < l {
+            return 0;
+        }
+        let levels = &mut self.levels[..];
+        for c in levels.iter_mut() {
             c.rolling = false;
         }
-        let mut hits = 0u64;
-        let windows = Windows::<W, _>::new(seq.iter().map(|&c| alphabet::rank(c)), l);
+        let shift = 2 * (l as u32 - 1);
+        let mask = idx.window_mask;
         let mut q = QueryKeys::empty();
-        for (wi, (v, rc)) in windows.enumerate() {
-            idx.fill_query_keys(v, rc, &mut q);
-            let hit = if self.found && self.extend(&q) {
-                self.extensions += 1;
-                for c in &mut self.levels {
-                    c.rolling = false;
+        let (mut v, mut rc) = (W::ZERO, W::ZERO);
+        for &c in &seq[..l - 1] {
+            let r = alphabet::rank(c) as u64;
+            v = (v >> 2) | (W::from_u64(r) << shift);
+            rc = ((rc << 2) | W::from_u64(r ^ 3)) & mask;
+        }
+        let mut anchor: Option<Anchor<W>> = None;
+        let (mut hits, mut ext) = (0u64, 0u64);
+        let mut rolling_valid = true;
+        for (wi, &c) in seq[l - 1..].iter().enumerate() {
+            let r = alphabet::rank(c) as u64;
+            v = (v >> 2) | (W::from_u64(r) << shift);
+            rc = ((rc << 2) | W::from_u64(r ^ 3)) & mask;
+            if SHAPES {
+                // extension compares the per-shape keys (kernel only if needed)
+                for (i, sh) in idx.shapes.iter().enumerate() {
+                    q.fwd[i] = v.pext(sh.w_mask);
+                    q.rev[i] = rc.pext(sh.w_mask);
                 }
+            }
+            let extended = match anchor.as_mut() {
+                Some(a) => {
+                    if SHAPES {
+                        extend::<W, true>(idx, a, &q)
+                    } else {
+                        extend_plain(idx, a, v, rc)
+                    }
+                }
+                None => false,
+            };
+            let hit = if extended {
+                ext += 1;
+                // the rolling minimisers are recomputed after an extension
+                rolling_valid = false;
                 true
             } else {
-                self.cascade(&q)
+                q.v = v;
+                q.rc = rc;
+                if SHAPES {
+                    let (k, krc) = idx.kernel_of(v, rc);
+                    q.kernel = k;
+                    q.kernel_rc = krc;
+                } else {
+                    q.kernel = v;
+                    q.kernel_rc = rc;
+                }
+                if !rolling_valid {
+                    for c in levels.iter_mut() {
+                        c.rolling = false;
+                    }
+                    rolling_valid = true;
+                }
+                let (hit, a) = cascade(idx, levels, &q);
+                anchor = a;
+                hit
             };
             hits += hit as u64;
             f(wi, hit);
         }
+        self.extensions += ext;
         hits
     }
+}
 
-    /// `extend_in_text`.
-    #[inline(always)]
-    fn extend(&mut self, q: &QueryKeys<W>) -> bool {
-        let idx = self.idx;
-        let text = &idx.text;
-        let l = idx.geo.window;
-        if idx.shapes.is_empty() {
-            if self.forward {
-                self.text_pos += 1;
-                self.text_pos < self.seq_end && text.base(self.text_pos) == (q.v >> (2 * (l - 1))).low_u64()
-            } else {
-                if self.text_pos == 0 {
-                    return false;
-                }
-                self.text_pos -= 1;
-                self.text_pos >= self.seq_start && text.base(self.text_pos) == q.rc.low_u64() & 3
-            }
-        } else if self.forward {
-            self.text_pos += 1;
-            let b = text.base(self.text_pos);
-            self.text_win = (self.text_win >> 2) | (W::from_u64(b) << (2 * (l - 1)));
-            let p = self.text_pos + 1 - l as u64;
-            idx.shapes.iter().enumerate().any(|(i, sh)| {
-                self.text_win.pext(sh.w_mask) == q.fwd[i]
-                    && p + sh.start as u64 >= self.seq_start
-                    && p + sh.end as u64 <= self.seq_end
-            })
+/// `extend_in_text` for contiguous k-mers: compare the one new base.
+#[inline(always)]
+fn extend_plain<W: KmerWord>(idx: &RsHash<W>, a: &mut Anchor<W>, v: W, rc: W) -> bool {
+    let text = &idx.text;
+    if a.forward {
+        a.text_pos += 1;
+        a.text_pos < a.seq_end && text.base(a.text_pos) == (v >> (2 * (idx.geo.window - 1))).low_u64()
+    } else {
+        if a.text_pos <= a.seq_start {
+            return false;
+        }
+        a.text_pos -= 1;
+        text.base(a.text_pos) == rc.low_u64() & 3
+    }
+}
+
+/// `extend_in_text`: does the text continue the previous match by one base?
+#[inline(always)]
+fn extend<W: KmerWord, const SHAPES: bool>(idx: &RsHash<W>, a: &mut Anchor<W>, q: &QueryKeys<W>) -> bool {
+    let text = &idx.text;
+    let l = idx.geo.window;
+    if !SHAPES {
+        if a.forward {
+            a.text_pos += 1;
+            a.text_pos < a.seq_end && text.base(a.text_pos) == (q.v >> (2 * (l - 1))).low_u64()
         } else {
-            if self.text_pos == 0 {
+            if a.text_pos <= a.seq_start {
                 return false;
             }
-            self.text_pos -= 1;
-            let b = text.base(self.text_pos);
-            self.text_win_rc = ((self.text_win_rc << 2) | W::from_u64(b)) & idx.window_mask;
-            let p = self.text_pos;
-            idx.shapes.iter().enumerate().any(|(i, sh)| {
-                self.text_win_rc.pext(sh.w_mask) == q.rev[i]
-                    && p + sh.start as u64 >= self.seq_start
-                    && p + sh.end as u64 <= self.seq_end
-            })
+            a.text_pos -= 1;
+            text.base(a.text_pos) == q.rc.low_u64() & 3
         }
+    } else if a.forward {
+        a.text_pos += 1;
+        let b = text.base(a.text_pos);
+        a.win = (a.win >> 2) | (W::from_u64(b) << (2 * (l - 1)));
+        let p = a.text_pos + 1 - l as u64;
+        idx.shapes.iter().enumerate().any(|(i, sh)| {
+            a.win.pext(sh.w_mask) == q.fwd[i] && p + sh.start as u64 >= a.seq_start && p + sh.end as u64 <= a.seq_end
+        })
+    } else {
+        if a.text_pos == 0 {
+            return false;
+        }
+        a.text_pos -= 1;
+        let b = text.base(a.text_pos);
+        a.win = ((a.win << 2) | W::from_u64(b)) & idx.window_mask;
+        let p = a.text_pos;
+        idx.shapes.iter().enumerate().any(|(i, sh)| {
+            a.win.pext(sh.w_mask) == q.rev[i] && p + sh.start as u64 >= a.seq_start && p + sh.end as u64 <= a.seq_end
+        })
     }
+}
 
-    /// The level cascade for a window that could not be extended.
-    #[inline]
-    fn cascade(&mut self, q: &QueryKeys<W>) -> bool {
-        let idx = self.idx;
-        let nlev = self.levels.len();
-        for l in 0..nlev {
-            let level = &idx.levels[l];
-            let c = &mut self.levels[l];
-            if c.rolling {
-                level.mp.update(q.kernel, q.kernel_rc, &mut c.st);
-            } else {
-                c.st = level.mp.find(q.kernel, q.kernel_rc);
-                c.rolling = true;
-            }
-            let v = c.st.value;
-            let resolved = if v == c.current {
-                true
-            } else if v != c.current_neg {
-                if let Some(rank) = level.r.contains(v) {
-                    fill_buffer(idx, level, rank, c, false);
-                    c.current = v;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if resolved {
-                self.found = self.lookup_buffer(l, q);
-                for c2 in &mut self.levels[l + 1..] {
-                    c2.rolling = false;
-                }
-                for c2 in &mut self.levels[..l] {
-                    c2.current_neg = c2.st.value;
-                }
-                return self.found;
-            }
-        }
-        self.found = false;
-        for c in &mut self.levels {
-            c.current_neg = c.st.value;
-        }
-        idx.last_contains(q)
-    }
-
-    /// `lookup_buffer` + `check_minimiser_pos(2)`.
-    #[inline]
-    fn lookup_buffer(&mut self, l: usize, q: &QueryKeys<W>) -> bool {
-        let idx = self.idx;
+/// The level cascade for a window that could not be extended. Returns
+/// whether the window is present and the match to extend from (none for
+/// last-level hits, as in C++). The common path (rolling update, cached
+/// minimiser) is inlined into the query loop; rare paths are out of line.
+#[inline(always)]
+fn cascade<W: KmerWord>(idx: &RsHash<W>, levels: &mut [LevelCache<W>], q: &QueryKeys<W>) -> (bool, Option<Anchor<W>>) {
+    for l in 0..levels.len() {
         let level = &idx.levels[l];
-        let c = &self.levels[l];
-        let st = c.st;
-        let span = level.mp.span() as usize;
-        let km = (idx.geo.kernel - level.mp.m) as usize;
-        let o_ = idx.geo.overlap as i64;
-        // candidate buffer indices (j) in C++ order
-        let mut js = [(0usize, true); 4];
-        js[0] = (span - 1 - st.left as usize, true);
-        js[1] = (st.left as usize, false);
-        let ncand = if st.has_tie(idx.geo.kernel, level.mp.m) {
-            js[2] = (st.right as usize, true);
-            js[3] = (km - st.right as usize, false);
-            4
+        let c = &mut levels[l];
+        if c.rolling {
+            level.mp.update(q.kernel, q.kernel_rc, &mut c.st);
         } else {
-            2
-        };
-        for i in 0..c.n {
-            let off = c.offsets[i];
-            let buf = &c.buffer[i * span..(i + 1) * span];
-            for &(j, fwd) in &js[..ncand] {
-                let win = buf[j];
-                let p = off + j as i64 - o_;
-                if let Some((s, e)) = idx.match_window(win, p, fwd, q) {
-                    self.forward = fwd;
-                    self.seq_start = s;
-                    self.seq_end = e;
-                    if fwd {
-                        self.text_pos = (p + idx.geo.window as i64 - 1) as u64;
-                        self.text_win = win;
-                    } else {
-                        self.text_pos = p as u64;
-                        self.text_win_rc = win;
-                    }
-                    return true;
+            c.st = level.mp.find(q.kernel, q.kernel_rc);
+            c.rolling = true;
+        }
+        let v = c.st.value;
+        let resolved = v == c.current || (v != c.current_neg && fetch_bucket(idx, level, c, v));
+        if resolved {
+            let anchor = lookup_buffer(idx, level, &levels[l], q);
+            for c2 in &mut levels[l + 1..] {
+                c2.rolling = false;
+            }
+            for c2 in &mut levels[..l] {
+                c2.current_neg = c2.st.value;
+            }
+            return (anchor.is_some(), anchor);
+        }
+    }
+    for c in levels.iter_mut() {
+        c.current_neg = c.st.value;
+    }
+    (last_level_contains(idx, q), None)
+}
+
+#[inline(never)]
+fn last_level_contains<W: KmerWord>(idx: &RsHash<W>, q: &QueryKeys<W>) -> bool {
+    idx.last_contains(q)
+}
+
+/// If minimiser `v` is kept at this level, decode its bucket into the cache.
+#[inline(never)]
+fn fetch_bucket<W: KmerWord>(idx: &RsHash<W>, level: &Level, c: &mut LevelCache<W>, v: u64) -> bool {
+    match level.r.contains(v) {
+        Some(rank) => {
+            fill_buffer(idx, level, rank, c, false);
+            c.current = v;
+            true
+        }
+        None => false,
+    }
+}
+
+#[allow(clippy::collapsible_if)]
+/// `lookup_buffer` + `check_minimiser_pos(2)`: check the left (and, on
+/// ties, right) candidates of every cached occurrence, in C++ order.
+#[inline(never)]
+fn lookup_buffer<W: KmerWord>(
+    idx: &RsHash<W>,
+    level: &Level,
+    c: &LevelCache<W>,
+    q: &QueryKeys<W>,
+) -> Option<Anchor<W>> {
+    let st = c.st;
+    let span = level.mp.span() as usize;
+    let km = (idx.geo.kernel - level.mp.m) as usize;
+    let tie = st.has_tie(idx.geo.kernel, level.mp.m);
+    // candidate buffer indices in C++ order: left fwd, left rc, right fwd, right rc
+    let (j0, j1) = (span - 1 - st.left as usize, st.left as usize);
+    let (j2, j3) = (st.right as usize, km - st.right as usize);
+    let o_ = idx.geo.overlap as i64;
+    let n = c.n;
+    assert!(c.offsets.len() >= n && c.buffer.len() >= n * span);
+    let found = |i: usize, j: usize, fwd: bool| -> Option<Anchor<W>> {
+        // SAFETY: i < n, j < span, and the buffer holds n * span windows
+        let win = unsafe { *c.buffer.get_unchecked(i * span + j) };
+        let p = unsafe { *c.offsets.get_unchecked(i) } + j as i64 - o_;
+        let (s, e) = idx.match_window(win, p, fwd, q)?;
+        let text_pos = if fwd { (p + idx.geo.window as i64 - 1) as u64 } else { p as u64 };
+        Some(Anchor { forward: fwd, text_pos, seq_start: s, seq_end: e, win })
+    };
+    if idx.shapes.is_empty() {
+        // cheap equality first; the bounds check only runs on a match
+        let (v, rc) = (q.v, q.rc);
+        for i in 0..n {
+            let b = i * span;
+            // SAFETY: as above
+            let w = |j: usize| unsafe { *c.buffer.get_unchecked(b + j) };
+            if w(j0) == v
+                && let Some(a) = found(i, j0, true)
+            {
+                return Some(a);
+            }
+            if w(j1) == rc
+                && let Some(a) = found(i, j1, false)
+            {
+                return Some(a);
+            }
+            if tie {
+                if w(j2) == v
+                    && let Some(a) = found(i, j2, true)
+                {
+                    return Some(a);
+                }
+                if w(j3) == rc
+                    && let Some(a) = found(i, j3, false)
+                {
+                    return Some(a);
                 }
             }
         }
-        false
+        None
+    } else {
+        for i in 0..n {
+            if let Some(a) = found(i, j0, true).or_else(|| found(i, j1, false)) {
+                return Some(a);
+            }
+            if tie && let Some(a) = found(i, j2, true).or_else(|| found(i, j3, false)) {
+                return Some(a);
+            }
+        }
+        None
     }
 }
 
 /// `fill_buffer<level>` / `fill_buffer2<level>`: decode all windows around
 /// each occurrence of the bucket (and, for locate, the bounds of the sequence
 /// containing the occurrence).
+#[allow(clippy::explicit_counter_loop)]
 fn fill_buffer<W: KmerWord>(idx: &RsHash<W>, level: &Level, rank: usize, c: &mut LevelCache<W>, with_bounds: bool) {
     let (s, e) = level.bucket(rank);
     let n = e - s;
@@ -572,10 +668,20 @@ fn fill_buffer<W: KmerWord>(idx: &RsHash<W>, level: &Level, rank: usize, c: &mut
             let p0 = p0 as u64;
             let mut win: W = idx.text.window(p0, l);
             buf[0] = win;
-            for (j, slot) in buf.iter_mut().enumerate().skip(1) {
-                let b = idx.text.base(p0 + l as u64 + j as u64 - 1);
-                win = (win >> 2) | (W::from_u64(b) << shift);
+            // the following bases, 32 at a time (as `get_word64` in C++)
+            let mut next = p0 + l as u64;
+            let mut bits = idx.text.word64(next);
+            let mut avail = 32u32;
+            for slot in buf.iter_mut().skip(1) {
+                if avail == 0 {
+                    bits = idx.text.word64(next);
+                    avail = 32;
+                }
+                win = (win >> 2) | (W::from_u64(bits & 3) << shift);
                 *slot = win;
+                bits >>= 2;
+                avail -= 1;
+                next += 1;
             }
         } else {
             for (j, slot) in buf.iter_mut().enumerate() {

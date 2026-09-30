@@ -47,7 +47,7 @@ impl Level {
 
     fn read(r: &mut Reader, mp: MinimizerParams, threshold: u16) -> io::Result<Self> {
         let rr = EliasFano::read(r)?;
-        let s = RankSelect::read(r)?;
+        let s = RankSelect::read_with_samples(r, true, false)?;
         let offsets = CompactVec::read(r)?;
         if s.count_ones() != rr.len() + 1 || s.len() != offsets.len() + 1 {
             return Err(invalid("level size mismatch"));
@@ -278,7 +278,7 @@ impl<W: KmerWord> RsHash<W> {
             log(&format!("level {}: build R ({} minimizers, {} occurrences)...", l + 1, keys.len(), offsets.len()));
             let r = EliasFano::new(&keys, mp.universe());
             drop(keys);
-            let s = RankSelect::new(s);
+            let s = RankSelect::with_samples(s, true, false);
             let level = Level { mp, threshold: params.t[l], r, s, offsets };
 
             // get_frequent_skmers: maximal runs of k-mers whose minimiser is not in R

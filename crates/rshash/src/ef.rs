@@ -54,7 +54,7 @@ impl<W: KmerWord> EliasFano<W> {
             }
             upper.set(Self::high_of(v, l) as usize + i);
         }
-        Self { n, l, lower_lo, lower_hi, upper: RankSelect::new(upper), _w: PhantomData }
+        Self { n, l, lower_lo, lower_hi, upper: RankSelect::with_samples(upper, false, true), _w: PhantomData }
     }
 
     #[inline(always)]
@@ -149,10 +149,39 @@ impl<W: KmerWord> EliasFano<W> {
     /// If `x` is present, its (first) index, i.e. `contains(x, rank_out)`.
     #[inline]
     pub fn contains(&self, x: W) -> Option<usize> {
+        if W::BITS == 64 {
+            return self.contains64(x.low_u64());
+        }
         match self.lower_bound_in_bucket(x) {
             Ok(i) if self.lower(i) == x.to_u128() & crate::word::mask128(self.l) => Some(i),
             _ => None,
         }
+    }
+
+    /// `contains` for 64-bit values (lower bits fit one packed vector).
+    #[inline]
+    fn contains64(&self, x: u64) -> Option<usize> {
+        if self.n == 0 {
+            return None;
+        }
+        let l = self.l;
+        let h = if l >= 64 { 0 } else { x >> l };
+        let max_high = (self.upper.len() - self.n - 1) as u64;
+        if h > max_high {
+            return None;
+        }
+        let (mut pos, mut i) = self.bucket_start(h);
+        let target = x & crate::word::mask64(l);
+        let words = self.upper.bits().words();
+        while (words[pos / 64] >> (pos % 64)) & 1 == 1 {
+            let lo = self.lower_lo.get(i);
+            if lo >= target {
+                return if lo == target { Some(i) } else { None };
+            }
+            pos += 1;
+            i += 1;
+        }
+        None
     }
 
     /// Number of values `< x`.
@@ -237,7 +266,7 @@ impl<W: KmerWord> EliasFano<W> {
         let l = r.u32()?;
         let lower_lo = CompactVec::read(r)?;
         let lower_hi = CompactVec::read(r)?;
-        let upper = RankSelect::read(r)?;
+        let upper = RankSelect::read_with_samples(r, false, true)?;
         if lower_lo.len() != n || upper.count_ones() != n {
             return Err(invalid("Elias-Fano length mismatch"));
         }

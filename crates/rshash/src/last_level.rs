@@ -77,8 +77,57 @@ pub struct LastTable<W: KmerWord> {
     pub positions: Option<CompactVec>,
     /// Width in bits of a key (for the Elias–Fano universe).
     pub key_bits: u32,
-    /// No keys (skips hashing on lookups).
-    empty: bool,
+    /// Derived (not serialised) one-hash bit filter over the keys (8–16 bits
+    /// per key): most probes of absent keys, the common case in streaming
+    /// lookups, stop here without touching the table.
+    filter: KeyFilter,
+}
+
+/// One-hash bit filter (a Bloom filter with a single hash function).
+#[derive(Clone, Debug, Default)]
+struct KeyFilter {
+    bits: Vec<u64>,
+    mask: u64,
+}
+
+#[inline(always)]
+fn fmix64(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
+}
+
+impl KeyFilter {
+    fn new<W: KmerWord>(keys: impl Iterator<Item = W>, n: usize) -> Self {
+        if n == 0 {
+            return Self::default();
+        }
+        let nbits = (8 * n).next_power_of_two().max(64);
+        let mut f = Self { bits: vec![0; nbits / 64], mask: nbits as u64 - 1 };
+        for k in keys {
+            let h = Self::hash(k) & f.mask;
+            f.bits[(h / 64) as usize] |= 1 << (h % 64);
+        }
+        f
+    }
+
+    #[inline(always)]
+    fn hash<W: KmerWord>(k: W) -> u64 {
+        let x = k.to_u128();
+        fmix64((x as u64) ^ ((x >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+    }
+
+    #[inline(always)]
+    fn may_contain<W: KmerWord>(&self, k: W) -> bool {
+        if self.bits.is_empty() {
+            return false;
+        }
+        let h = Self::hash(k) & self.mask;
+        // SAFETY: h <= mask < 64 * bits.len()
+        (unsafe { *self.bits.get_unchecked((h / 64) as usize) } >> (h % 64)) & 1 == 1
+    }
 }
 
 impl<W: KmerWord> LastTable<W> {
@@ -140,18 +189,18 @@ impl<W: KmerWord> LastTable<W> {
                 j += c as usize;
                 bv.set(j);
             }
-            (Some(RankSelect::new(bv)), Some(CompactVec::from_slice(&positions, pos_width)))
+            (Some(RankSelect::with_samples(bv, true, false)), Some(CompactVec::from_slice(&positions, pos_width)))
         } else {
             (None, None)
         };
 
-        let empty = keys.is_empty();
-        Self { keys: keys_struct, buckets, positions, key_bits, empty }
+        let filter = KeyFilter::new(keys.iter().copied(), keys.len());
+        Self { keys: keys_struct, buckets, positions, key_bits, filter }
     }
 
     #[inline]
     pub fn contains(&self, key: W) -> bool {
-        if self.empty {
+        if !self.filter.may_contain(key) {
             return false;
         }
         match &self.keys {
@@ -164,6 +213,9 @@ impl<W: KmerWord> LastTable<W> {
     /// Text positions (window starts) stored for `key` (requires `loc`).
     pub fn positions(&self, key: W, out: &mut Vec<u64>) {
         let (Some(buckets), Some(pos)) = (&self.buckets, &self.positions) else { return };
+        if !self.filter.may_contain(key) {
+            return;
+        }
         let b = match &self.keys {
             Keys::Set(_) => return,
             Keys::Map(m) => match m.get(&key) {
@@ -203,7 +255,9 @@ impl<W: KmerWord> LastTable<W> {
             Keys::Map(m) => m.capacity() * (W::BITS as usize + 32 + 8),
             Keys::Ef(ef) => ef.bit_size(),
         };
-        keys + self.buckets.as_ref().map_or(0, |b| b.bit_size()) + self.positions.as_ref().map_or(0, |p| p.bit_size())
+        keys + 64 * self.filter.bits.len()
+            + self.buckets.as_ref().map_or(0, |b| b.bit_size())
+            + self.positions.as_ref().map_or(0, |p| p.bit_size())
     }
 
     fn sorted_keys(&self) -> Vec<W> {
@@ -269,10 +323,14 @@ impl<W: KmerWord> LastTable<W> {
             2 => Keys::Ef(EliasFano::read(r)?),
             _ => return Err(invalid("bad last-level tag")),
         };
-        let (buckets, positions) =
-            if r.bool()? { (Some(RankSelect::read(r)?), Some(CompactVec::read(r)?)) } else { (None, None) };
-        let mut t = Self { keys, buckets, positions, key_bits, empty: false };
-        t.empty = t.is_empty();
+        let (buckets, positions) = if r.bool()? {
+            (Some(RankSelect::read_with_samples(r, true, false)?), Some(CompactVec::read(r)?))
+        } else {
+            (None, None)
+        };
+        let mut t = Self { keys, buckets, positions, key_bits, filter: KeyFilter::default() };
+        let n = t.len();
+        t.filter = KeyFilter::new(t.sorted_keys().into_iter(), n);
         Ok(t)
     }
 }

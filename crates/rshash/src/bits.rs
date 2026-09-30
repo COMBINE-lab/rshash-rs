@@ -133,94 +133,96 @@ pub struct RankSelect {
 /// Sampling rate of exact positions for the fast select path.
 const POS_SAMPLE: usize = 256;
 /// Secondary sampling rate inside long spans.
-const SUB_SAMPLE: usize = 32;
-/// Max words between two samples for the linear-scan fast path.
-const MAX_SCAN_WORDS: u64 = 16;
+const SUB_SAMPLE: usize = 64;
 
-/// Two-level exact position samples (in the spirit of sux's `SimpleSelect`):
-/// the position of every 256th target bit, plus the offsets of every 32nd
-/// target bit inside spans longer than [`MAX_SCAN_WORDS`] words.
+/// Exact-position select samples in the layout of sux's `SimpleSelect(Zero)Half`:
+/// for every 256th target bit, one `u64` with its position followed by eight
+/// 16-bit offsets of every 32nd target bit, interleaved (24 bytes) so a select
+/// touches one inventory cache line and then scans at most a few words.
+/// Spans too long for 16-bit offsets are flagged and use the block directory.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Samples {
-    /// Position of every `POS_SAMPLE`-th target bit, then a sentinel (`len`).
-    pos: Vec<u64>,
-    /// Per primary sample: start in `sub`, or `u32::MAX` for short spans.
-    sub_idx: Vec<u32>,
-    /// Offsets from the primary sample of every `SUB_SAMPLE`-th target bit.
-    sub: Vec<u32>,
+    /// `3 * ceil(targets / 256)` words: `[start | LONG, sub0..3, sub4..7]`.
+    inv: Vec<u64>,
 }
+
+const INV_STRIDE: usize = 1 + POS_SAMPLE / SUB_SAMPLE / 4;
+const LONG_SPAN: u64 = 1 << 63;
 
 impl Samples {
     fn build(bits: &BitVec, ones: bool) -> Self {
-        let mut pos = Vec::new();
-        let mut chunk: Vec<u64> = Vec::with_capacity(POS_SAMPLE / SUB_SAMPLE);
-        let mut chunks: Vec<Vec<u64>> = Vec::new();
+        let mut inv: Vec<u64> = Vec::new();
+        let mut subs = [0u64; POS_SAMPLE / SUB_SAMPLE];
         let mut c = 0usize;
+        let flush = |inv: &mut Vec<u64>, subs: &[u64; POS_SAMPLE / SUB_SAMPLE], n: usize| {
+            let start = subs[0];
+            let span_ok = subs[..n].iter().all(|&p| p - start < 1 << 16);
+            if !span_ok {
+                inv.push(start | LONG_SPAN);
+                inv.extend([0; INV_STRIDE - 1]);
+                return;
+            }
+            let mut w = [0u64; INV_STRIDE - 1];
+            for (k, &p) in subs[..n].iter().enumerate() {
+                w[k / 4] |= (p - start) << (16 * (k % 4));
+            }
+            inv.push(start);
+            inv.extend(w);
+        };
         for (wi, &w) in bits.words.iter().enumerate() {
             let valid = if (wi + 1) * 64 <= bits.len() { 64 } else { (bits.len() - wi * 64) as u32 };
             let mut x = if ones { w } else { !w } & mask64(valid);
             while x != 0 {
                 let p = (wi * 64) as u64 + x.trailing_zeros() as u64;
                 x &= x - 1;
-                if c.is_multiple_of(POS_SAMPLE) {
-                    if c > 0 {
-                        chunks.push(std::mem::take(&mut chunk));
-                    }
-                    pos.push(p);
-                }
                 if c.is_multiple_of(SUB_SAMPLE) {
-                    chunk.push(p);
+                    subs[(c % POS_SAMPLE) / SUB_SAMPLE] = p;
                 }
                 c += 1;
+                if c.is_multiple_of(POS_SAMPLE) {
+                    flush(&mut inv, &subs, POS_SAMPLE / SUB_SAMPLE);
+                }
             }
         }
-        if c > 0 {
-            chunks.push(chunk);
+        if !c.is_multiple_of(POS_SAMPLE) {
+            flush(&mut inv, &subs, (c % POS_SAMPLE).div_ceil(SUB_SAMPLE));
         }
-        pos.push(bits.len() as u64);
-        let mut sub_idx = Vec::with_capacity(chunks.len());
-        let mut sub = Vec::new();
-        for (s, ch) in chunks.iter().enumerate() {
-            if (pos[s + 1] >> 6) - (pos[s] >> 6) > MAX_SCAN_WORDS && pos[s + 1] - pos[s] < u32::MAX as u64 {
-                sub_idx.push(sub.len() as u32);
-                // always POS_SAMPLE / SUB_SAMPLE entries (the last chunk is padded
-                // with the span end)
-                sub.extend(ch.iter().map(|&p| (p - pos[s]) as u32));
-                sub.extend(std::iter::repeat_n((pos[s + 1] - pos[s]) as u32, POS_SAMPLE / SUB_SAMPLE - ch.len()));
-            } else {
-                sub_idx.push(u32::MAX);
-            }
-        }
-        Self { pos, sub_idx, sub }
+        Self { inv }
     }
 
     /// Start position and remaining count for a linear scan to the `r`-th
-    /// target bit, or `None` if the span is too long (use the directory).
+    /// target bit, or `None` for long spans (use the directory).
     #[inline(always)]
     fn start(&self, r: usize) -> Option<(u64, u32)> {
-        let s = r / POS_SAMPLE;
-        let p0 = self.pos[s];
-        let p1 = self.pos[s + 1];
-        if (p1 >> 6) - (p0 >> 6) <= MAX_SCAN_WORDS {
-            return Some((p0, (r % POS_SAMPLE) as u32));
+        let base = (r / POS_SAMPLE) * INV_STRIDE;
+        if base >= self.inv.len() {
+            return None;
         }
-        let si = self.sub_idx[s];
-        if si == u32::MAX {
+        // SAFETY: r < number of target bits, so its inventory entry exists.
+        let start = unsafe { *self.inv.get_unchecked(base) };
+        if start & LONG_SPAN != 0 {
             return None;
         }
         let k = (r % POS_SAMPLE) / SUB_SAMPLE;
-        let q0 = p0 + self.sub[si as usize + k] as u64;
-        let q1 = if k + 1 < POS_SAMPLE / SUB_SAMPLE { p0 + self.sub[si as usize + k + 1] as u64 } else { p1 };
-        if (q1 >> 6) - (q0 >> 6) <= MAX_SCAN_WORDS { Some((q0, (r % SUB_SAMPLE) as u32)) } else { None }
+        let w = unsafe { *self.inv.get_unchecked(base + 1 + k / 4) };
+        let off = (w >> (16 * (k % 4))) & 0xFFFF;
+        Some((start + off, (r % SUB_SAMPLE) as u32))
     }
 
     fn bit_size(&self) -> usize {
-        64 * self.pos.len() + 32 * (self.sub_idx.len() + self.sub.len())
+        64 * self.inv.len()
     }
 }
 
 impl RankSelect {
+    /// Rank/select with fast select samples for both ones and zeros.
     pub fn new(bits: BitVec) -> Self {
+        Self::with_samples(bits, true, true)
+    }
+
+    /// Only build the fast-select samples that will be used (`select1`
+    /// and/or `select0`); the other select falls back to the block directory.
+    pub fn with_samples(bits: BitVec, want1: bool, want0: bool) -> Self {
         let nblocks = bits.len().div_ceil(BLOCK_BITS);
         let mut block_ones = Vec::with_capacity(nblocks + 1);
         let mut sub = Vec::with_capacity(nblocks);
@@ -258,8 +260,8 @@ impl RankSelect {
         block_ones.push(ones as u64);
         sel1.push(nblocks as u32);
         sel0.push(nblocks as u32);
-        let pos1 = Samples::build(&bits, true);
-        let pos0 = Samples::build(&bits, false);
+        let pos1 = if want1 { Samples::build(&bits, true) } else { Samples::default() };
+        let pos0 = if want0 { Samples::build(&bits, false) } else { Samples::default() };
         Self { bits, block_ones, sub, sel1, sel0, pos1, pos0, ones }
     }
 
@@ -314,8 +316,11 @@ impl RankSelect {
     #[inline]
     pub fn select1(&self, r: usize) -> usize {
         if let Some((p0, mut rem)) = self.pos1.start(r) {
+            let words = self.bits.words();
             let mut wi = (p0 >> 6) as usize;
-            let mut w = self.bits.words[wi] & !mask64((p0 & 63) as u32);
+            // SAFETY: the target one exists (r < count_ones), so the scan stays
+            // within the words of the vector.
+            let mut w = unsafe { *words.get_unchecked(wi) } & !mask64((p0 & 63) as u32);
             loop {
                 let c = w.count_ones();
                 if rem < c {
@@ -323,7 +328,7 @@ impl RankSelect {
                 }
                 rem -= c;
                 wi += 1;
-                w = self.bits.words[wi];
+                w = unsafe { *words.get_unchecked(wi) };
             }
         }
         self.select1_blocks(r)
@@ -410,8 +415,10 @@ impl RankSelect {
     #[inline]
     pub fn select0(&self, r: usize) -> usize {
         if let Some((p0, mut rem)) = self.pos0.start(r) {
+            let words = self.bits.words();
             let mut wi = (p0 >> 6) as usize;
-            let mut w = !self.bits.words[wi] & !mask64((p0 & 63) as u32);
+            // SAFETY: the target zero exists (r < number of zeros).
+            let mut w = !unsafe { *words.get_unchecked(wi) } & !mask64((p0 & 63) as u32);
             loop {
                 let c = w.count_ones();
                 if rem < c {
@@ -419,7 +426,7 @@ impl RankSelect {
                 }
                 rem -= c;
                 wi += 1;
-                w = !self.bits.words[wi];
+                w = !unsafe { *words.get_unchecked(wi) };
             }
         }
         self.select0_blocks(r)
@@ -468,6 +475,11 @@ impl RankSelect {
     pub fn read(r: &mut Reader) -> io::Result<Self> {
         Ok(Self::new(BitVec::read(r)?))
     }
+
+    /// [`Self::read`] building only the selected fast-select samples.
+    pub fn read_with_samples(r: &mut Reader, ones: bool, zeros: bool) -> io::Result<Self> {
+        Ok(Self::with_samples(BitVec::read(r)?, ones, zeros))
+    }
 }
 
 /// Fixed-width bit-packed vector of integers of `width <= 64` bits.
@@ -513,9 +525,7 @@ impl CompactVec {
     #[inline(always)]
     pub fn get(&self, i: usize) -> u64 {
         debug_assert!(i < self.len);
-        if self.width == 0 {
-            return 0;
-        }
+        // width 0: pos = 0, off = 0, the mask clears the word
         let pos = i * self.width as usize;
         let wi = pos / 64;
         let off = (pos % 64) as u32;
@@ -681,8 +691,6 @@ mod span_tests {
             bv.set((v >> 16) as usize + i);
         }
         let rs = RankSelect::new(bv);
-        let slow = rs.pos0.pos.windows(2).filter(|w| (w[1] >> 6) - (w[0] >> 6) > MAX_SCAN_WORDS).count();
-        eprintln!("pos0 samples {} long {}", rs.pos0.pos.len(), slow);
         for r in 0..rs.len() - rs.count_ones() {
             assert_eq!(rs.select0(r), rs.select0_blocks(r));
         }

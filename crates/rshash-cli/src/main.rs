@@ -160,10 +160,11 @@ fn num_windows(len: usize, l: u32) -> u64 {
 
 fn lookup(args: &Args) -> Result<()> {
     let Some(qpath) = &args.query else { bail!("provide query file.") };
-    println!("loading queries...");
-    let queries = input::read_sequences(qpath).with_context(|| format!("reading {}", qpath.display()))?;
+    // load the index before the queries (see `locate`)
     let index = load(args)?;
     println!("loaded index...");
+    println!("loading queries...");
+    let queries = input::read_sequences(qpath).with_context(|| format!("reading {}", qpath.display()))?;
     println!("querying...");
     let l = index.window();
     let mut dump: Option<Box<dyn Write>> = match &args.dump {
@@ -199,10 +200,12 @@ fn lookup(args: &Args) -> Result<()> {
 
 fn locate(args: &Args) -> Result<()> {
     let Some(qpath) = &args.query else { bail!("provide query file.") };
-    println!("loading queries...");
-    let queries = input::read_sequences(qpath).with_context(|| format!("reading {}", qpath.display()))?;
+    // load the index before the queries: its large arrays then get better
+    // (transparent huge page) placement, measurably speeding up queries
     println!("loading dict...");
     let index = load(args)?;
+    println!("loading queries...");
+    let queries = input::read_sequences(qpath).with_context(|| format!("reading {}", qpath.display()))?;
     if !index.has_locate() {
         bail!("index does not support locate");
     }

@@ -81,6 +81,23 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let idx = AnyIndex::load_file(&a[1]).unwrap();
     let qs = input::read_sequences(&a[2]).unwrap();
+    if let Some(reps) = a.get(3) {
+        // streaming lookup only, repeated (for `perf stat`)
+        let reps: usize = reps.parse().unwrap();
+        rshash::with_index!(&idx, i => {
+            let n: usize = qs.iter().map(|q| (q.len() + 1).saturating_sub(i.window() as usize)).sum();
+            let mut e = i.streaming_lookup();
+            let t = Instant::now();
+            let mut s = 0;
+            for _ in 0..reps {
+                for q in &qs {
+                    s += e.query(q);
+                }
+            }
+            println!("streaming only: {:.2} ns/kmer ({s})", t.elapsed().as_nanos() as f64 / n as f64 / reps as f64);
+        });
+        return;
+    }
     match &idx {
         AnyIndex::W64(i) => run(i, &qs),
         AnyIndex::W128(i) => run(i, &qs),

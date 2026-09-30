@@ -195,20 +195,31 @@ The same comparison on C. elegans (100 Mbp genome, 500k reads, default parameter
 
 ### Performance
 
-Measured single-threaded on an AMD EPYC 9555, with the upstream C++ built with gcc 14.2 `-O3 -march=native`:
+Measured single-threaded on an AMD EPYC 9555, with the upstream C++ built with gcc 14.2 `-O3 -march=native`. Lookup numbers are medians over repeated `lookup` runs, in ns per k-mer.
 
 | | C++ | Rust |
 |---|---:|---:|
-| E. coli, `-k 31 --level 1`, streaming lookup (ns/k-mer) | 9.5 | 10.6 |
-| E. coli, 3 levels, streaming lookup (ns/k-mer) | 19.8 | 20.4 |
-| E. coli, `--shapes 0x5FFFFFFD`, streaming lookup (ns/k-mer) | 12.6 | 14.4 |
-| E. coli, space (bits/k-mer, `-k 31 --level 1`) | 7.79 | 7.79 |
+| E. coli, `-k 31 --level 1`, streaming lookup | 9.4 | 9.4 |
+| E. coli, 3 levels, streaming lookup | 19.8 | 18.1 |
+| E. coli, `-k 21 --loc`, streaming lookup | 13.4 | 13.7 |
+| E. coli, `--shapes 0x5FFFFFFD`, streaming lookup | 12.6 | 13.2 |
+| C. elegans, streaming lookup (500k reads) | 22.8 | 22.5 |
+| E. coli, space (bits/k-mer, `-k 31 --level 1`) | 7.79 | 7.75 |
+| E. coli, space (bits/k-mer, `-k 21 --loc`) | 10.99 | 10.01 |
+| C. elegans, space (bits/k-mer) | 7.66 | 7.68 |
 | C. elegans, build time / peak memory | 3.3 s / 431 MB | 4.0 s / 342 MB |
-| C. elegans, space (bits/k-mer) | 7.66 | 7.71 |
-| C. elegans, streaming lookup (ns/k-mer) | 22.5 | 24.7 |
-| E. coli, random point lookups, positive / negative (ns) | 98 / 68 | 110 / 59 |
+| E. coli, random point lookups, positive / negative (ns) | 98 / 68 | 105 / 56 |
+
+Positive point lookups also check that the match lies within one input sequence (D4); the C++ point lookup skips this check.
 
 Locate isn't directly comparable. The C++ version neither returns positions nor reports last-level hits (D6).
+
+The streaming-lookup hot path was tuned against the C++ binary using hardware counters. `parity/cpp/cpp_components.cpp` and `crates/rshash/examples/components.rs` time the same components on both sides. The main changes:
+
+- the per-window match state lives in registers;
+- select uses a sux-style interleaved inventory (one cache line, then a short scan);
+- candidate checks and bucket decoding are specialised;
+- a one-hash filter sits in front of the last-level tables.
 
 ## License
 

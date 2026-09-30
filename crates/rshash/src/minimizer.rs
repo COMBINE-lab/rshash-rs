@@ -71,7 +71,7 @@ impl MinimizerParams {
     }
 
     /// `find_minimiser`: full scan of the k-mer, from the last m-mer to the first.
-    #[inline]
+    #[inline(never)]
     pub fn find<W: KmerWord>(&self, kmer: W, kmer_rc: W) -> MinState {
         let (k, m) = (self.k, self.m);
         let mut mmer = (kmer >> (2 * (k - m))).low_u64() & self.mask;
@@ -91,7 +91,7 @@ impl MinimizerParams {
     }
 
     /// `update_minimiser`: slide by one base (the new m-mer is the last one).
-    #[inline]
+    #[inline(always)]
     pub fn update<W: KmerWord>(&self, kmer: W, kmer_rc: W, st: &mut MinState) {
         if st.left == 0 {
             *st = self.find(kmer, kmer_rc);
@@ -108,6 +108,88 @@ impl MinimizerParams {
         } else {
             st.right += 1;
         }
+    }
+}
+
+/// Sliding-window minimum with leftmost *and* rightmost ties, in amortised
+/// O(1) and without branches on the data (the "two stacks" / van Herk–Gil–
+/// Werman scheme used by `simd-minimizers`, Groot Koerkamp & Martayan 2025).
+///
+/// Elements are packed as `(score << 64) | pos` (leftmost tie wins) and
+/// `(score << 64) | !pos` (rightmost tie wins), so each push costs a few
+/// `u128` minima; every `w` pushes the finished block is turned into suffix
+/// minima. Scores are kept exact (no truncation), so the result is identical
+/// to [`MinimizerParams::find`].
+#[derive(Clone, Debug, Default)]
+pub struct SlidingLr {
+    w: usize,
+    idx: usize,
+    ring_l: Vec<u128>,
+    ring_r: Vec<u128>,
+    pre_l: u128,
+    pre_r: u128,
+}
+
+impl SlidingLr {
+    pub fn new(w: usize) -> Self {
+        assert!(w > 0);
+        Self { w, idx: 0, ring_l: vec![u128::MAX; w], ring_r: vec![u128::MAX; w], pre_l: u128::MAX, pre_r: u128::MAX }
+    }
+
+    #[inline(always)]
+    pub fn reset(&mut self) {
+        self.idx = 0;
+        self.pre_l = u128::MAX;
+        self.pre_r = u128::MAX;
+    }
+
+    /// Push the score of the m-mer at (absolute) position `pos`; returns the
+    /// packed leftmost and rightmost minima of the last `w` pushes (valid once
+    /// `w` elements have been pushed since [`Self::reset`]).
+    #[inline(always)]
+    pub fn push(&mut self, score: u64, pos: u64) -> (u128, u128) {
+        let kl = ((score as u128) << 64) | pos as u128;
+        let kr = ((score as u128) << 64) | (!pos) as u128;
+        let w = self.w;
+        // SAFETY: idx < w == ring lengths
+        unsafe {
+            *self.ring_l.get_unchecked_mut(self.idx) = kl;
+            *self.ring_r.get_unchecked_mut(self.idx) = kr;
+        }
+        self.pre_l = self.pre_l.min(kl);
+        self.pre_r = self.pre_r.min(kr);
+        self.idx += 1;
+        if self.idx == w {
+            self.idx = 0;
+            for i in (0..w - 1).rev() {
+                self.ring_l[i] = self.ring_l[i].min(self.ring_l[i + 1]);
+                self.ring_r[i] = self.ring_r[i].min(self.ring_r[i + 1]);
+            }
+            self.pre_l = u128::MAX;
+            self.pre_r = u128::MAX;
+        }
+        // SAFETY: idx < w
+        let (sl, sr) = unsafe { (*self.ring_l.get_unchecked(self.idx), *self.ring_r.get_unchecked(self.idx)) };
+        (self.pre_l.min(sl), self.pre_r.min(sr))
+    }
+}
+
+impl MinimizerParams {
+    /// Decode the result of [`SlidingLr::push`] for the k-mer whose first
+    /// m-mer is at position `start`.
+    #[inline(always)]
+    pub fn decode_lr(&self, (l, r): (u128, u128), start: u64) -> MinState {
+        let left = (l as u64 - start) as u32;
+        let rightmost = (!(r as u64) - start) as u32;
+        MinState { value: (l >> 64) as u64, left, right: self.k - self.m - rightmost }
+    }
+
+    /// Score of the m-mer at offset `i` of a k-mer (and its rc).
+    #[inline(always)]
+    pub fn score_at<W: KmerWord>(&self, kmer: W, kmer_rc: W, i: u32) -> u64 {
+        let mmer = (kmer >> (2 * i)).low_u64() & self.mask;
+        let mmer_rc = (kmer_rc >> (2 * (self.k - self.m - i))).low_u64() & self.mask;
+        self.score(mmer, mmer_rc)
     }
 }
 
@@ -294,6 +376,32 @@ mod tests {
                 };
                 assert_eq!(r, expect, "k={k} m={m} pos={pos}");
                 rolling = Some(r);
+            }
+        }
+    }
+
+    #[test]
+    fn sliding_lr_matches_find() {
+        let mut st = 5u64;
+        for &(k, m, alpha) in &[(31u32, 18u32, 4usize), (21, 11, 2), (15, 15, 4), (47, 20, 2), (9, 3, 1), (32, 8, 2)] {
+            let seq = random_seq(&mut st, 500, alpha);
+            let text = Text::from_sequences(&[&seq]);
+            let p = MinimizerParams::new(k, m, 3);
+            let w = p.span() as usize;
+            let mut lr = SlidingLr::new(w);
+            for wi in 0..(500 - k as u64 + 1) {
+                let kmer: u128 = text.window(32 + wi, k);
+                let rc = kmer.rc(k);
+                let res = if wi == 0 {
+                    let mut r = (0, 0);
+                    for i in 0..w as u32 {
+                        r = lr.push(p.score_at(kmer, rc, i), i as u64);
+                    }
+                    r
+                } else {
+                    lr.push(p.score_at(kmer, rc, k - m), wi + w as u64 - 1)
+                };
+                assert_eq!(p.decode_lr(res, wi), p.find(kmer, rc), "k={k} m={m} wi={wi}");
             }
         }
     }
